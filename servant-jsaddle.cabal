@@ -42,6 +42,7 @@ library
   exposed-modules:
     Servant.Client.Internal.JSaddleXhrClient
     Servant.Client.JSaddle
+    Servant.Client.JSaddle.Streaming
 
   -- Bundled with GHC: Lower bound to not force re-installs
   -- text and mtl are bundled starting with GHC-8.4
@@ -50,6 +51,7 @@ library
     , bytestring    >=0.10.8.1 && <0.13
     , containers    >=0.5.7.1  && <0.7
     , mtl           >=2.2.2    && <2.4
+    , stm           >=2.5      && <2.6
     , text          >=1.2.3.0  && <2.2
     , transformers  >=0.5.2.0  && <0.7
 
@@ -59,6 +61,7 @@ library
   -- Servant dependencies.
   -- Strict dependency on `servant-client-core` as we re-export things.
   build-depends:    servant-client-core >=0.16 && <0.21
+                  , servant             >=0.16 && <0.21
   build-depends:
       base-compat         >=0.10.5 && <=0.13.1
     , case-insensitive    >=1.2.0.0 && <1.3
