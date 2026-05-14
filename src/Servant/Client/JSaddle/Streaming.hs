@@ -1,4 +1,3 @@
-{-# LANGUAGE DeriveFunctor              #-}
 {-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -6,176 +5,265 @@
 {-# LANGUAGE MultiParamTypeClasses      #-}
 {-# LANGUAGE OverloadedStrings          #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
--- | Streaming support for the JSaddle XHR client.
+-- | Streaming support for the JSaddle client.
 --
--- Three things in this module:
+-- The 'RunStreamingClient' instance for the 'ClientM' from
+-- "Servant.Client.Internal.JSaddleXhrClient" is implemented here. It
+-- is backed by the browser @fetch@ API and @ReadableStream@: each
+-- 'BodyReader'-style pull from the servant-side 'ST.SourceT'
+-- corresponds to one @reader.read()@ on the response stream, so
+-- chunks are forwarded to the consumer as they arrive on the wire.
+-- The fetch runs to natural completion; abandoning the 'ST.SourceT'
+-- mid-stream leaks the response body until the browser closes it.
 --
---   * 'sendStreamingRequest' — JSaddle-native primitive. Fires an XHR
---     and invokes a caller-supplied callback as bytes arrive
---     (@progress@), the request completes (@load@), or it fails
---     (@error@). No FRP types — bridge to your event system of choice
---     using this as the bottom layer.
---
---   * 'CaptureRequest' / 'getRequest' — a tiny monad whose 'RunClient'
---     and 'RunStreamingClient' instances *capture* the 'Request'
---     instead of executing it. Lets callers extract a type-derived
---     'Request' from any servant typed-client call and then hand it to
---     'sendStreamingRequest' directly (i.e. type-driven URL/headers
---     without paying for ClientM's actual execution).
---
---   * 'RunStreamingClient' instance for 'ClientM' — degraded: waits for
---     the full response then yields it as a single chunk through
---     'SourceT'. This makes servant APIs containing 'Stream' / 'StreamGet'
---     compile against 'ClientM'; for progressive-as-it-arrives semantics
---     reach for 'sendStreamingRequest' directly.
+-- Also exports 'CaptureRequest': a tiny monad whose 'RunClient' and
+-- 'RunStreamingClient' instances *capture* the 'Request' that
+-- servant's typed client constructs instead of executing it. Useful
+-- for piping a typed servant API definition through to a custom
+-- transport (e.g. websockets, server-sent events) that takes a
+-- 'Request' directly while keeping URL / headers / query construction
+-- type-driven.
 module Servant.Client.JSaddle.Streaming
-  ( -- * JSaddle-native streaming
-    StreamEvent (..)
-  , sendStreamingRequest
-    -- * Type-driven Request capture
-  , CaptureRequest
+  ( -- * Type-driven Request capture
+    CaptureRequest
   , runCaptureRequest
   , getRequest
   , captureRequest
   ) where
 
-import           Control.Concurrent.MVar             (newEmptyMVar, takeMVar,
-                                                       tryPutMVar)
-import           Control.Concurrent.STM              (atomically)
-import           Control.Concurrent.STM.TBQueue      (newTBQueueIO,
-                                                       readTBQueue, writeTBQueue)
-import           Control.Monad                       (void, when)
-import           Control.Monad.IO.Class              (liftIO)
-import           Control.Monad.Reader                (ask)
-import qualified Data.ByteString                     as BS
-import           Data.IORef                          (newIORef, readIORef,
-                                                       writeIORef)
-import           Data.Text                           (Text)
-import qualified Data.Text                           as T
-import qualified Data.Text.Encoding                  as TE
+import           Control.Concurrent.MVar     (newEmptyMVar, putMVar, takeMVar)
+import           Control.Exception           (throwIO)
+import           Control.Monad               (forM_, void)
+import           Control.Monad.Error.Class   (MonadError (..))
+import           Control.Monad.IO.Class      (liftIO)
+import           Control.Monad.Reader        (ask)
+import qualified Data.ByteString             as BS
+import qualified Data.ByteString.Lazy        as BSL
+import           Data.CaseInsensitive        (mk, original)
+import           Data.Foldable               (toList)
+import           Data.IORef                  (modifyIORef', newIORef, readIORef)
+import           Data.Proxy                  (Proxy (..))
+import qualified Data.Sequence               as Seq
+import qualified Data.Text                   as T
+import qualified Data.Text.Encoding          as TE
 
-import qualified GHCJS.DOM.EventM                    as JSDOM
-import qualified GHCJS.DOM.Types                     as JS
-import qualified GHCJS.DOM.XMLHttpRequest            as JS
-import qualified GHCJS.DOM.XMLHttpRequestEventTarget as JSXRET
+import qualified GHCJS.Buffer                as Buffer
+import qualified GHCJS.DOM.Types             as JS
+import qualified JavaScript.TypedArray.ArrayBuffer as ArrayBuffer
+import qualified JavaScript.TypedArray.ArrayBuffer.Internal as ABI
 
-import           Network.HTTP.Types                  (http11, mkStatus)
+import           Lens.Micro                  ((^.))
+import           Language.Javascript.JSaddle
+                  ( JSM, JSVal, (#), freeFunction, fromJSValUnchecked,
+                    function, js, js2, jsg, jss, new, obj, toJSVal,
+                    valIsNull )
+import qualified Language.Javascript.JSaddle as JSaddle
 
-import           Control.Monad.Error.Class           (MonadError (..))
-import           Data.Proxy                          (Proxy (..))
+import           Network.HTTP.Media          (renderHeader)
+import           Network.HTTP.Types          (Header, http11, mkStatus)
+
+import qualified Servant.Types.SourceT       as ST
 import           Servant.Client.Core
-                 ( Client, ClientError, HasClient, Request, ResponseF (..),
-                   RunClient (..), RunStreamingClient (..),
-                   clientIn, requestMethod )
-import qualified Servant.Types.SourceT               as ST
 
 import           Servant.Client.Internal.JSaddleXhrClient
-                 ( ClientEnv (..), ClientM (..), decodeUtf8Lenient, sendXhr,
-                   setHeaders, toBody, toUrl )
+                  (ClientEnv (..), ClientM (..), decodeUtf8Lenient, toUrl)
 
 -- ────────────────────────────────────────────────────────────────────
--- Stream events (Layer 1: jsaddle-native, no FRP)
+-- RunStreamingClient: fetch + ReadableStream
 -- ────────────────────────────────────────────────────────────────────
 
--- | One event in the lifetime of a streaming XHR.
-data StreamEvent
-  = StreamChunk !BS.ByteString
-    -- ^ Bytes received since the previous event.
-  | StreamDone  !Word
-    -- ^ The XHR's @load@ event fired. Payload is the final HTTP status.
-    -- No further events follow.
-  | StreamFail  !Text
-    -- ^ The XHR's @error@ event fired (network error, abort, …).
-    -- No further events follow.
-  deriving (Show, Eq)
-
--- | Fire an XHR built from a servant 'Request'. Each event arriving
--- from the transport (chunk, completion, error) invokes the supplied
--- callback exactly once, in arrival order. The callback runs in
--- 'JS.DOM', so any 'JSaddle' / IO action is available there.
---
--- The XHR uses the default response type so that
--- 'XMLHttpRequest.responseText' is readable as bytes arrive — chunk
--- positions are tracked across @progress@ firings.
-sendStreamingRequest
-  :: ClientEnv
-  -> Request
-  -> (StreamEvent -> JS.DOM ())
-  -> JS.DOM ()
-sendStreamingRequest env request fire = do
-    let burl  = baseUrl env
-        fixUp = fixUpXhr env
-    xhr <- JS.newXMLHttpRequest
-
-    let username, password :: Maybe JS.JSString
-        username = Nothing; password = Nothing
-    JS.open xhr (decodeUtf8Lenient $ requestMethod request) (toUrl burl request) True username password
-    setHeaders xhr request
-    fixUp xhr
-
-    posRef <- liftIO (newIORef 0)
-
-    let pushNew = do
-          mtxt <- JS.getResponseText xhr
-          case mtxt of
-            Nothing -> pure ()
-            Just s  -> do
-              let txt   = T.pack s
-                  total = T.length txt
-              pos <- liftIO (readIORef posRef)
-              when (total > pos) $ do
-                let chunk = TE.encodeUtf8 (T.drop pos txt)
-                liftIO (writeIORef posRef total)
-                fire (StreamChunk chunk)
-
-    void $ JSDOM.on xhr JSXRET.progress (JS.liftJSM pushNew)
-    void $ JSDOM.on xhr JSXRET.load $ JS.liftJSM $ do
-      pushNew
-      s <- JS.getStatus xhr
-      fire (StreamDone (fromIntegral s))
-    void $ JSDOM.on xhr JSXRET.error $ JS.liftJSM $
-      fire (StreamFail "network error")
-
-    sendXhr xhr (toBody request)
-
--- ────────────────────────────────────────────────────────────────────
--- RunStreamingClient (Layer 2: degraded — full-then-yield)
--- ────────────────────────────────────────────────────────────────────
-
--- | Progressive 'RunStreamingClient': bridges the async XHR push model
--- into the 'SourceIO' sync-pull model used by 'withStreamingRequest'.
---
--- A bounded 'TBQueue' buffers chunks between the producer (XHR
--- callback firing per @progress@ event) and the consumer (the @k@
--- callback's 'SourceT' iteration). An 'MVar' lets the consumer block
--- until the first event arrives so we know the HTTP status before
--- constructing the 'Response'.
---
--- Trade-offs: the response status is inferred (200 on first chunk,
--- exact on @load@) and 'responseHeaders' is empty. For
--- header-sensitive callers use 'sendStreamingRequest' directly.
+-- | Each call to the SourceT's pull action corresponds to one
+-- @reader.read()@ on the response's 'ReadableStream'. Bytes are
+-- forwarded to the consumer as they arrive, not buffered until the
+-- response completes. Status and headers are read from the @Response@
+-- object before the body is touched, so they're exact (not inferred
+-- from the first chunk like the previous XHR implementation).
 instance RunStreamingClient ClientM where
   withStreamingRequest req k = do
-    env  <- ask
-    domc <- ClientM JS.askDOM
-    liftIO $ do
-      queue    <- newTBQueueIO 64
-      respMVar <- newEmptyMVar
-      flip JS.runDOM domc $ sendStreamingRequest env req $ \case
-        StreamChunk c -> liftIO $ do
-          _ <- tryPutMVar respMVar (mkStatus 200 "")
-          atomically (writeTBQueue queue (Just c))
-        StreamDone s  -> liftIO $ do
-          _ <- tryPutMVar respMVar (mkStatus (fromIntegral s) "")
-          atomically (writeTBQueue queue Nothing)
-        StreamFail _  -> liftIO $
-          atomically (writeTBQueue queue Nothing)
-      status <- takeMVar respMVar
-      let pull = ST.Effect $ atomically (readTBQueue queue) >>= \case
-            Just c  -> pure (ST.Yield c pull)
-            Nothing -> pure ST.Stop
-          resp = Response status mempty http11 (ST.SourceT ($ pull))
-      k resp
+    env <- ask
+    ctx <- ClientM JSaddle.askJSM
+    liftIO (JSaddle.runJSM (fetchStreaming env req k) ctx)
+
+-- | Fire @req@ via the browser @fetch@ API and hand a 'Response' to
+-- @k@, whose body is a 'ST.SourceT' driven by the response stream's
+-- reader.
+fetchStreaming
+  :: ClientEnv
+  -> Request
+  -> (ResponseF (ST.SourceT IO BS.ByteString) -> IO a)
+  -> JSM a
+fetchStreaming env req k = do
+  let url = toUrl (baseUrl env) req
+
+  -- ── Build the fetch init object ──
+  initObj <- obj
+
+  do  mVal <- toJSVal (decodeUtf8Lenient (requestMethod req))
+      initObj ^. jss ("method" :: T.Text) mVal
+
+  hdrsObj <- new (jsg ("Headers" :: T.Text)) ()
+  forM_ (toList (requestAccept req)) $ \media ->
+    void $ hdrsObj # ("append" :: T.Text) $
+      ( "Accept" :: T.Text
+      , decodeUtf8Lenient (renderHeader media) )
+  case requestBody req of
+    Just (_, media) ->
+      void $ hdrsObj # ("append" :: T.Text) $
+        ( "Content-Type" :: T.Text
+        , decodeUtf8Lenient (renderHeader media) )
+    Nothing -> pure ()
+  forM_ (toList (requestHeaders req)) $ \(name, value) ->
+    void $ hdrsObj # ("append" :: T.Text) $
+      ( decodeUtf8Lenient (original name)
+      , decodeUtf8Lenient value )
+  do  hVal <- toJSVal hdrsObj
+      initObj ^. jss ("headers" :: T.Text) hVal
+
+  case requestBody req of
+    Nothing                       -> pure ()
+    Just (RequestBodyBS bs, _)    -> do
+      b <- bsToArrayBuffer bs
+      initObj ^. jss ("body" :: T.Text) b
+    Just (RequestBodyLBS lbs, _)  -> do
+      b <- bsToArrayBuffer (BSL.toStrict lbs)
+      initObj ^. jss ("body" :: T.Text) b
+    Just (RequestBodySource _, _) ->
+      liftIO (throwIO (userError "RequestBodySource isn't supported"))
+
+  -- ── Fire the fetch, await the Response ──
+  global  <- jsg ("globalThis" :: T.Text)
+  promise <- global ^. js2 ("fetch" :: T.Text) url initObj
+  resp    <- awaitJSPromise promise >>= \case
+    Right r -> pure r
+    Left  _ -> liftIO (throwIO (userError "fetch failed"))
+
+  statusN     <- fromJSValUnchecked =<< resp ^. js ("status"     :: T.Text)
+  statusTextS <- fromJSValUnchecked =<< resp ^. js ("statusText" :: T.Text)
+  hdrs        <- readResponseHeaders resp
+
+  -- ── Build the SourceT body backed by the reader ──
+  bodyVal  <- resp ^. js ("body" :: T.Text)
+  bodyNull <- valIsNull bodyVal
+  ctx      <- JSaddle.askJSM
+
+  source <-
+    if bodyNull
+      then pure (ST.SourceT ($ ST.Stop))
+      else do
+        reader <- bodyVal # ("getReader" :: T.Text) $ ()
+        let pullIO :: IO BS.ByteString
+            pullIO = JSaddle.runJSM (pullChunk reader) ctx
+            step = ST.Effect $ do
+              bs <- pullIO
+              pure $ if BS.null bs then ST.Stop else ST.Yield bs step
+        pure (ST.SourceT ($ step))
+
+  let resp' = Response
+        { responseStatusCode  =
+            mkStatus statusN (TE.encodeUtf8 (T.pack statusTextS))
+        , responseHeaders     = Seq.fromList hdrs
+        , responseHttpVersion = http11
+        , responseBody        = source
+        }
+
+  -- NB: we intentionally do *not* bracket the fetch with an abort on
+  -- `k`'s return. servant-client-core's typed Stream client calls k
+  -- with the raw response, wraps the body lazily with framing /
+  -- decoding, and returns the wrapped SourceT — consumed *after* k
+  -- (and therefore after withStreamingRequest) returns. Aborting on
+  -- k's return would tear the fetch down before any chunk is pulled.
+  -- The fetch runs to natural completion; a SourceT that is abandoned
+  -- mid-stream will leak the response body until the browser closes
+  -- it (TODO: wire an AbortController-based cleanup hook through to
+  -- the source's drain path).
+  liftIO (k resp')
+
+-- ────────────────────────────────────────────────────────────────────
+-- JSM helpers: promise await, chunk conversion, header iteration
+-- ────────────────────────────────────────────────────────────────────
+
+-- | Block the current JSM thread until @p@ settles. Right = resolved
+-- value, Left = rejection reason.
+--
+-- Works under both jsaddle-warp (the JS-side @.then@ callback round-
+-- trips back to the Haskell-side function over the bridge and unblocks
+-- the 'MVar') and GHCJS in-browser (the green thread suspends on
+-- 'takeMVar' and resumes when the callback runs).
+awaitJSPromise :: JSVal -> JSM (Either JSVal JSVal)
+awaitJSPromise p = do
+  mv <- liftIO newEmptyMVar
+  cbResolve <- function $ \_ _ args -> do
+    v <- case args of (x:_) -> pure x; _ -> toJSVal ()
+    liftIO (putMVar mv (Right v))
+  cbReject <- function $ \_ _ args -> do
+    v <- case args of (x:_) -> pure x; _ -> toJSVal ()
+    liftIO (putMVar mv (Left v))
+  _ <- p ^. js2 ("then" :: T.Text) cbResolve cbReject
+  r <- liftIO (takeMVar mv)
+  freeFunction cbResolve
+  freeFunction cbReject
+  pure r
+
+-- | One read from a @ReadableStreamDefaultReader@. Returns the chunk
+-- as a 'BS.ByteString'; empty 'BS.ByteString' signals EOF (matching
+-- the 'BodyReader' convention from @http-client@). Empty chunks from
+-- the underlying stream are looped over so the EOF signal stays
+-- unambiguous, and read errors are mapped to EOF.
+pullChunk :: JSVal -> JSM BS.ByteString
+pullChunk reader = do
+  promise <- reader # ("read" :: T.Text) $ ()
+  awaitJSPromise promise >>= \case
+    Left _ -> pure BS.empty
+    Right chunkObj -> do
+      done <- fromJSValUnchecked =<< chunkObj ^. js ("done" :: T.Text)
+      if done
+        then pure BS.empty
+        else do
+          valV <- chunkObj ^. js ("value" :: T.Text)
+          bs   <- u8ArrayToBS valV
+          if BS.null bs then pullChunk reader else pure bs
+
+-- | Copy a 'Uint8Array' (or any typed-array view) into a strict
+-- 'BS.ByteString' via 'GHCJS.Buffer'. Reads @.buffer@, @.byteOffset@,
+-- @.byteLength@ from the view so views over a larger backing buffer
+-- are sliced correctly.
+u8ArrayToBS :: JSVal -> JSM BS.ByteString
+u8ArrayToBS u8 = do
+  abVal   <- u8 ^. js ("buffer"     :: T.Text)
+  offset  <- fromJSValUnchecked =<< u8 ^. js ("byteOffset" :: T.Text)
+  byteLen <- fromJSValUnchecked =<< u8 ^. js ("byteLength" :: T.Text)
+  let ab = ABI.SomeArrayBuffer abVal :: ArrayBuffer.ArrayBuffer
+  buf <- JSaddle.ghcjsPure (Buffer.createFromArrayBuffer ab)
+  JSaddle.ghcjsPure (Buffer.toByteString offset (Just byteLen) buf)
+
+-- | Wrap a strict 'BS.ByteString' as a fresh 'ArrayBuffer' suitable
+-- for use as @fetch@'s @body@ init field. Copies, so the source
+-- bytestring's pinned buffer can be freed independently.
+bsToArrayBuffer :: BS.ByteString -> JSM JSVal
+bsToArrayBuffer bs = do
+  (b, _off, _len) <- JSaddle.ghcjsPure (Buffer.fromByteString (BS.copy bs))
+  mb <- Buffer.thaw b
+  ab <- JSaddle.ghcjsPure (Buffer.getArrayBuffer mb)
+  pure (JS.pToJSVal ab)
+
+-- | Iterate the @Headers@ object via its @forEach@ method. The
+-- callback receives @(value, key, parent)@; we collect into a list,
+-- reversed at the end so order matches arrival.
+readResponseHeaders :: JSVal -> JSM [Header]
+readResponseHeaders respVal = do
+  hdrsVal <- respVal ^. js ("headers" :: T.Text)
+  ref     <- liftIO (newIORef [])
+  cb <- function $ \_ _ args -> case args of
+    (v:k:_) -> do
+      kT <- fromJSValUnchecked k :: JSM T.Text
+      vT <- fromJSValUnchecked v :: JSM T.Text
+      liftIO $ modifyIORef' ref
+        ((mk (TE.encodeUtf8 kT), TE.encodeUtf8 vT) :)
+    _ -> pure ()
+  cbVal <- toJSVal cb
+  _ <- hdrsVal # ("forEach" :: T.Text) $ cbVal
+  freeFunction cb
+  reverse <$> liftIO (readIORef ref)
 
 -- ────────────────────────────────────────────────────────────────────
 -- CaptureRequest: extract a type-derived Request without executing
@@ -187,8 +275,8 @@ instance RunStreamingClient ClientM where
 -- 'Request' out via 'getRequest'.
 --
 -- Use case: wire a typed servant client API through to a custom
--- transport (e.g. 'sendStreamingRequest') that takes a 'Request'
--- directly, while keeping URL/headers/query construction type-driven.
+-- transport that takes a 'Request' directly, while keeping URL /
+-- headers / query construction type-driven.
 newtype CaptureRequest a = CaptureRequest
   { runCaptureRequest :: Either Request a }
   deriving (Functor)
@@ -217,9 +305,8 @@ instance RunStreamingClient CaptureRequest where
   withStreamingRequest req _ = CaptureRequest (Left req)
 
 -- | Pull the captured 'Request' out of a 'CaptureRequest' action.
--- Returns 'Nothing' if the action returned via 'pure' without ever
--- calling 'runRequest' / 'withStreamingRequest' (which only happens for
--- degenerate / empty client actions).
+-- 'Nothing' iff the action returned via 'pure' without ever calling
+-- 'runRequest' / 'withStreamingRequest' (degenerate / empty clients).
 getRequest :: CaptureRequest a -> Maybe Request
 getRequest (CaptureRequest (Left r))  = Just r
 getRequest (CaptureRequest (Right _)) = Nothing
