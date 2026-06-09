@@ -55,6 +55,7 @@ import           Data.Proxy
 import qualified Data.Sequence                     as Seq
 import           Data.String.Conversions
                  (cs)
+import qualified Data.Text                         as Text
 import qualified Data.Text.Encoding                as T
 import qualified Data.Text.Encoding.Error          as T
 import           GHC.Generics
@@ -288,9 +289,25 @@ toResponse domc xhr = do
   case status of
     0 -> throwError $ ConnectionError $ toException JSaddleConnectionError
     _ -> inDom $ do
-      statusText <- BS.pack <$> JS.getStatusText xhr
+      -- Same UTF-8 fix as for the body below: 'BS.pack' is
+      -- 'Data.ByteString.Char8.pack' which truncates each Char to
+      -- its low byte. Reason phrases are usually ASCII so this was
+      -- a latent bug, but a server returning a non-ASCII reason
+      -- phrase (RFC allows it) would have produced invalid UTF-8.
+      statusText <- T.encodeUtf8 . Text.pack <$> JS.getStatusText xhr
       headers <- parseHeaders <$> JS.getAllResponseHeaders xhr
-      responseText <- maybe "" (L.fromStrict . BS.pack) <$> JS.getResponseText xhr -- FIXME: Text/Binary? Performance? Test?
+      -- JS.getResponseText gives us the browser-decoded body as a
+      -- Haskell String of Unicode codepoints. The old impl used
+      -- 'Data.ByteString.Char8.pack', which truncates each Char to
+      -- its low byte — so any non-ASCII codepoint (e.g. 'ó' = U+00F3)
+      -- became a single invalid byte (0xF3) in the ByteString and
+      -- Aeson's strict UTF-8 decoder downstream blew up with
+      -- "Invalid UTF-8 stream". Going through 'T.encodeUtf8' produces
+      -- proper multi-byte UTF-8 (0xC3 0xB3 for ó). The 'Nothing' arm
+      -- stays as empty — at the HTTP level "no body" and "empty body"
+      -- are the same thing (e.g. 204 No Content), and Response's body
+      -- type is fixed as ByteString so we can't propagate the Maybe.
+      responseText <- maybe "" (L.fromStrict . T.encodeUtf8 . Text.pack) <$> JS.getResponseText xhr
       pure Response
         { responseStatusCode  = mkStatus (fromIntegral status) statusText
         , responseBody        = responseText
