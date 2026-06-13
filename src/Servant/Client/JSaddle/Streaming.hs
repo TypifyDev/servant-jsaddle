@@ -49,8 +49,8 @@ import qualified Data.Text.Encoding          as TE
 
 import qualified GHCJS.Buffer                as Buffer
 import qualified GHCJS.DOM.Types             as JS
+import           GHCJS.Marshal.Pure          (pFromJSVal)
 import qualified JavaScript.TypedArray.ArrayBuffer as ArrayBuffer
-import qualified JavaScript.TypedArray.ArrayBuffer.Internal as ABI
 
 import           Lens.Micro                  ((^.))
 import           Language.Javascript.JSaddle
@@ -232,7 +232,8 @@ u8ArrayToBS u8 = do
   abVal   <- u8 ^. js ("buffer"     :: T.Text)
   offset  <- fromJSValUnchecked =<< u8 ^. js ("byteOffset" :: T.Text)
   byteLen <- fromJSValUnchecked =<< u8 ^. js ("byteLength" :: T.Text)
-  let ab = ABI.SomeArrayBuffer abVal :: ArrayBuffer.ArrayBuffer
+  let mab = pFromJSVal abVal :: ArrayBuffer.MutableArrayBuffer
+  ab  <- liftIO (ArrayBuffer.unsafeFreeze mab)
   buf <- JSaddle.ghcjsPure (Buffer.createFromArrayBuffer ab)
   JSaddle.ghcjsPure (Buffer.toByteString offset (Just byteLen) buf)
 
