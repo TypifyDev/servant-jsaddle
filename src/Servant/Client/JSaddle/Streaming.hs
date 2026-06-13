@@ -233,7 +233,7 @@ u8ArrayToBS u8 = do
   offset  <- fromJSValUnchecked =<< u8 ^. js ("byteOffset" :: T.Text)
   byteLen <- fromJSValUnchecked =<< u8 ^. js ("byteLength" :: T.Text)
   let mab = pFromJSVal abVal :: ArrayBuffer.MutableArrayBuffer
-  ab  <- liftIO (ArrayBuffer.unsafeFreeze mab)
+  ab  <- ArrayBuffer.unsafeFreeze mab
   buf <- JSaddle.ghcjsPure (Buffer.createFromArrayBuffer ab)
   JSaddle.ghcjsPure (Buffer.toByteString offset (Just byteLen) buf)
 
